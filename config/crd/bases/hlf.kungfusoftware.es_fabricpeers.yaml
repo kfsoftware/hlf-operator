@@ -450,6 +450,10 @@ spec:
               tag:
                 minLength: 1
                 type: string
+              updateCertificateTime:
+                format: date-time
+                nullable: true
+                type: string
             required:
             - couchdb
             - discovery
@@ -512,6 +516,10 @@ spec:
                   - type
                   type: object
                 type: array
+              lastCertificateUpdate:
+                format: date-time
+                nullable: true
+                type: string
               message:
                 type: string
               port:

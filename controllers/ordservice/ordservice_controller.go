@@ -470,6 +470,7 @@ func (r *FabricOrderingServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Resu
 			log.Infof("Status hasn't changed, skipping update")
 		} else {
 			cmd := action.NewUpgrade(cfg)
+			cmd.MaxHistory = 5
 			err = os.Setenv("HELM_NAMESPACE", req.Namespace)
 			if err != nil {
 				return ctrl.Result{}, err

@@ -901,7 +901,7 @@ var _ = Describe("Fabric Controllers", func() {
 				if err != nil {
 					return false
 				}
-				ctrl.Log.WithName("test").Info("after update", "updatedCA", updatedCA)
+				ctrl.Log.WithName("test").Info("status of ca %s", "status", updatedCA.Status)
 				return updatedCA.Status.Status == hlfv1alpha1.RunningStatus
 			},
 			defTimeoutSecs,

@@ -43,7 +43,7 @@ spec:
           metadata:
             type: object
           spec:
-            description: FabricOrderingServiceSpec defines the desired state of FabricOrderingService
+            description: FabricOrdererNodeSpec defines the desired state of FabricOrdererNode
             properties:
               adminIstio:
                 nullable: true
@@ -274,6 +274,10 @@ spec:
               tag:
                 minLength: 1
                 type: string
+              updateCertificateTime:
+                format: date-time
+                nullable: true
+                type: string
             required:
             - bootstrapMethod
             - channelParticipationEnabled
@@ -331,12 +335,18 @@ spec:
                   - type
                   type: object
                 type: array
+              lastCertificateUpdate:
+                format: date-time
+                nullable: true
+                type: string
               message:
                 type: string
               operationsPort:
                 type: integer
               port:
                 type: integer
+              signCert:
+                type: string
               status:
                 type: string
               tlsAdminCert:

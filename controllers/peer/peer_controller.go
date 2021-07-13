@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"github.com/kfsoftware/hlf-operator/controllers/hlfmetrics"
+	"k8s.io/apimachinery/pkg/types"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -71,7 +74,66 @@ type Status struct {
 	NodePort int
 }
 
-func GetPeerState(peer *hlfv1alpha1.FabricPeer, conf *action.Configuration, config *rest.Config, releaseName string, ns string, svc *corev1.Service) (*hlfv1alpha1.FabricPeerStatus, error) {
+const (
+	deploymentRestartTriggerAnnotation = "es.kungfusoftware.hlf.deployment-restart.timestamp"
+)
+
+func restartDeployment(config *rest.Config, deployment *appsv1.Deployment) error {
+	clientSet, err := utils.GetClientKubeWithConf(config)
+	if err != nil {
+		return err
+	}
+
+	patchData := map[string]interface{}{}
+	patchData["spec"] = map[string]interface{}{
+		"template": map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					deploymentRestartTriggerAnnotation: time.Now().Format(time.Stamp),
+				},
+			},
+		},
+	}
+	encodedData, err := json.Marshal(patchData)
+	if err != nil {
+		return err
+	}
+	_, err = clientSet.AppsV1().Deployments(deployment.Namespace).Patch(context.TODO(), deployment.Name, types.MergePatchType, encodedData, v1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func GetPeerDeployment(conf *action.Configuration, config *rest.Config, releaseName string, ns string, ) (*appsv1.Deployment, error, ) {
+	ctx := context.Background()
+	cmd := action.NewGet(conf)
+	rel, err := cmd.Run(releaseName)
+	if err != nil {
+		return nil, err
+	}
+	clientSet, err := utils.GetClientKubeWithConf(config)
+	if err != nil {
+		return nil, err
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	objects := utils.ParseK8sYaml([]byte(rel.Manifest))
+	for _, object := range objects {
+		kind := object.GetObjectKind().GroupVersionKind().Kind
+		if kind == "Deployment" {
+			depSpec := object.(*appsv1.Deployment)
+			dep, err := clientSet.AppsV1().Deployments(ns).Get(ctx, depSpec.Name, v1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return dep, nil
+		}
+	}
+	return nil, errors.Errorf("Deployment not found")
+
+}
+func GetPeerState(conf *action.Configuration, config *rest.Config, releaseName string, ns string, svc *corev1.Service) (*hlfv1alpha1.FabricPeerStatus, error) {
 	ctx := context.Background()
 	cmd := action.NewGet(conf)
 	rel, err := cmd.Run(releaseName)
@@ -142,13 +204,26 @@ func GetPeerState(peer *hlfv1alpha1.FabricPeer, conf *action.Configuration, conf
 	}
 	r.TlsCert = string(utils.EncodeX509Certificate(tlsCrt))
 	r.TlsCACert = string(utils.EncodeX509Certificate(rootTlsCrt))
-
+	hlfmetrics.UpdateCertificateExpiry(
+		"peer",
+		"tls",
+		tlsCrt,
+		releaseName,
+		ns,
+	)
 	signCrt, _, rootSignCrt, err := getExistingSignCrypto(clientSet, releaseName, ns)
 	if err != nil {
 		return nil, err
 	}
 	r.SignCert = string(utils.EncodeX509Certificate(signCrt))
 	r.SignCACert = string(utils.EncodeX509Certificate(rootSignCrt))
+	hlfmetrics.UpdateCertificateExpiry(
+		"peer",
+		"sign",
+		signCrt,
+		releaseName,
+		ns,
+	)
 	return r, nil
 }
 
@@ -177,9 +252,16 @@ const chartName = "hlf-peer"
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
+
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=extensions,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=replicasets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=extensions,resources=replicasets,verbs=get;list;watch;create;update;patch;delete
+
 
 // +kubebuilder:rbac:groups=apps,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
@@ -220,7 +302,7 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 	ns := req.Namespace
 	cfg, err := newActionCfg(r.Log, r.Config, ns)
 	if err != nil {
-		setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+		r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 		return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 	}
 	err = r.Get(ctx, req.NamespacedName, fabricPeer)
@@ -235,7 +317,7 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 			return ctrl.Result{}, nil
 		}
 		reqLogger.Error(err, "Failed to get Peer.")
-		setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+		r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 		return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 	}
 
@@ -243,13 +325,13 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 	if isPeerMarkedToDelete {
 		if utils.Contains(fabricPeer.GetFinalizers(), peerFinalizer) {
 			if err := r.finalizePeer(reqLogger, fabricPeer); err != nil {
-				setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+				r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 				return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 			}
 			controllerutil.RemoveFinalizer(fabricPeer, peerFinalizer)
 			err := r.Update(ctx, fabricPeer)
 			if err != nil {
-				setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+				r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 				return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 			}
 		}
@@ -257,7 +339,7 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 	}
 	if !utils.Contains(fabricPeer.GetFinalizers(), peerFinalizer) {
 		if err := r.addFinalizer(reqLogger, fabricPeer); err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 	}
@@ -270,14 +352,14 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 			exists = false
 		} else {
 			// it doesnt exist
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 	}
 	log.Debugf("Release %s exists=%v", releaseName, exists)
 	clientSet, err := utils.GetClientKubeWithConf(r.Config)
 	if err != nil {
-		setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+		r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 		return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 	}
 	svc, err := createPeerService(
@@ -286,24 +368,59 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 		fabricPeer,
 	)
 	if err != nil {
-		setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+		r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 		return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 	}
 	reqLogger.Info(fmt.Sprintf("Service %s created", svc.Name))
 	if exists {
 		// update
-		s, err := GetPeerState(
-			fabricPeer,
-			cfg,
-			r.Config,
-			releaseName,
-			ns,
-			svc,
-		)
+		c, err := GetConfig(fabricPeer, clientSet, releaseName, req.Namespace, svc, false)
 		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
+
+		err = r.upgradeChart(cfg, err, ns, releaseName, c)
+		if err != nil {
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
+		}
+		lastTimeCertsRenewed := fabricPeer.Status.LastCertificateUpdate
+		if fabricPeer.Status.LastCertificateUpdate != nil {
+			if fabricPeer.Status.LastCertificateUpdate != nil {
+				lastCertificateUpdate := fabricPeer.Status.LastCertificateUpdate.Time
+				if fabricPeer.Spec.UpdateCertificateTime.Time.After(lastCertificateUpdate) {
+					// must update the certificates and block until it's done
+					// scale down to zero replicas
+					// wait for the deployment to scale down
+					// update the certs
+					// scale up the peer
+					log.Infof("Trying to upgrade certs")
+					err := r.updateCerts(req, fabricPeer, clientSet, releaseName, svc, ctx, cfg, ns)
+					if err != nil {
+						log.Errorf("Error renewing certs: %v", err)
+						r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+						return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
+					}
+					lastTimeCertsRenewed = fabricPeer.Spec.UpdateCertificateTime
+				}
+			}
+		} else if fabricPeer.Status.LastCertificateUpdate == nil && fabricPeer.Spec.UpdateCertificateTime != nil {
+			log.Infof("Trying to upgrade certs")
+			err := r.updateCerts(req, fabricPeer, clientSet, releaseName, svc, ctx, cfg, ns)
+			if err != nil {
+				log.Errorf("Error renewing certs: %v", err)
+				r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+				return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
+			}
+			lastTimeCertsRenewed = fabricPeer.Spec.UpdateCertificateTime
+		}
+		s, err := GetPeerState(cfg, r.Config, releaseName, ns, svc)
+		if err != nil {
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
+		}
+
 		fPeer := fabricPeer.DeepCopy()
 		fPeer.Status.Status = s.Status
 		fPeer.Status.TlsCert = s.TlsCert
@@ -311,55 +428,26 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 		fPeer.Status.SignCert = s.SignCert
 		fPeer.Status.SignCACert = s.SignCACert
 		fPeer.Status.NodePort = s.NodePort
+		fPeer.Status.LastCertificateUpdate = lastTimeCertsRenewed
 		fPeer.Status.Conditions.SetCondition(status.Condition{
 			Type:   status.ConditionType(s.Status),
 			Status: "True",
 		})
-		c, err := GetConfig(fabricPeer, clientSet, releaseName, req.Namespace, svc)
-		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
-			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
-		}
-		inrec, err := json.Marshal(c)
-		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
-			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
-		}
-		var inInterface map[string]interface{}
-		err = json.Unmarshal(inrec, &inInterface)
-		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
-			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
-		}
-		cmd := action.NewUpgrade(cfg)
-		err = os.Setenv("HELM_NAMESPACE", ns)
-		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
-			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
-		}
-		settings := cli.New()
-		chartPath, err := cmd.LocateChart(r.ChartPath, settings)
-		ch, err := loader.Load(chartPath)
-		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
-			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
-		}
-		release, err := cmd.Run(releaseName, ch, inInterface)
-		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
-			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
-		}
-		log.Infof("Chart upgraded %s", release.Name)
-		//if !reflect.DeepEqual(fPeer.Status, fabricPeer.Status) {
+		if !reflect.DeepEqual(fPeer.Status, fabricPeer.Status) {
 			if err := r.Status().Update(ctx, fPeer); err != nil {
 				log.Errorf("Error updating the status: %v", err)
-				setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+				r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 				return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 			}
-		//}
+		}
 		log.Infof("Peer %s in %s status", fPeer.Name, string(s.Status))
 		switch s.Status {
 		case hlfv1alpha1.PendingStatus:
+			log.Infof("Peer %s in %s status", fPeer.Name, string(s.Status))
+			return ctrl.Result{
+				RequeueAfter: 10 * time.Second,
+			}, nil
+		case hlfv1alpha1.FailedStatus:
 			log.Infof("Peer %s in %s status", fPeer.Name, string(s.Status))
 			return ctrl.Result{
 				RequeueAfter: 10 * time.Second,
@@ -375,14 +463,14 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 		cmd := action.NewInstall(cfg)
 		name, chart, err := cmd.NameAndChart([]string{releaseName, r.ChartPath})
 		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 
 		cmd.ReleaseName = name
 		ch, err := loader.Load(chart)
 		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 		c, err := GetConfig(
@@ -391,27 +479,27 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 			name,
 			req.Namespace,
 			svc,
+			false,
 		)
 		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 		var inInterface map[string]interface{}
 		inrec, err := json.Marshal(c)
 		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 		err = json.Unmarshal(inrec, &inInterface)
 		if err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 		release, err := cmd.Run(ch, inInterface)
 		if err != nil {
 			reqLogger.Error(err, "Failed to install chart")
-			setConditionStatus(fabricPeer, "", false, err, false)
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 		log.Infof("Chart installed %s", release.Name)
@@ -422,7 +510,7 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 			LastTransitionTime: v1.Time{},
 		})
 		if err := r.Status().Update(ctx, fabricPeer); err != nil {
-			setConditionStatus(fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricPeer, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricPeer)
 		}
 		return ctrl.Result{
@@ -432,7 +520,76 @@ func (r *FabricPeerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 	}
 }
 
-func setConditionStatus(p *hlfv1alpha1.FabricPeer, conditionType hlfv1alpha1.DeploymentStatus, statusFlag bool, err error, statusUnknown bool) (update bool) {
+func (r *FabricPeerReconciler) updateCerts(req ctrl.Request, fPeer *hlfv1alpha1.FabricPeer, clientSet *kubernetes.Clientset, releaseName string, svc *corev1.Service, ctx context.Context, cfg *action.Configuration, ns string) error {
+	log.Infof("Trying to upgrade certs")
+	r.setConditionStatus(ctx, fPeer, hlfv1alpha1.UpdatingCertificates, false, nil, false)
+	config, err := GetConfig(fPeer, clientSet, releaseName, req.Namespace, svc, true)
+	if err != nil {
+		log.Errorf("Error getting the config: %v", err)
+		return err
+	}
+	//config.Replicas = 0
+	err = r.upgradeChart(cfg, err, ns, releaseName, config)
+	if err != nil {
+		return err
+	}
+	dep, err := GetPeerDeployment(
+		cfg,
+		r.Config,
+		releaseName,
+		req.Namespace,
+	)
+	if err != nil {
+		return err
+	}
+	err = restartDeployment(
+		r.Config,
+		dep,
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *FabricPeerReconciler) upgradeChart(
+	cfg *action.Configuration,
+	err error,
+	ns string,
+	releaseName string,
+	c *FabricPeerChart,
+) error {
+	inrec, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	var inInterface map[string]interface{}
+	err = json.Unmarshal(inrec, &inInterface)
+	if err != nil {
+		return err
+	}
+	cmd := action.NewUpgrade(cfg)
+	cmd.MaxHistory = 5
+	err = os.Setenv("HELM_NAMESPACE", ns)
+	if err != nil {
+		return err
+	}
+	settings := cli.New()
+	chartPath, err := cmd.LocateChart(r.ChartPath, settings)
+	ch, err := loader.Load(chartPath)
+	if err != nil {
+		return err
+	}
+	cmd.Wait = true
+	release, err := cmd.Run(releaseName, ch, inInterface)
+	if err != nil {
+		return err
+	}
+	log.Infof("Chart upgraded %s", release.Name)
+	return nil
+}
+
+func (r *FabricPeerReconciler) setConditionStatus(ctx context.Context, p *hlfv1alpha1.FabricPeer, conditionType hlfv1alpha1.DeploymentStatus, statusFlag bool, err error, statusUnknown bool) (update bool) {
 	statusStr := func() corev1.ConditionStatus {
 		if statusUnknown {
 			return corev1.ConditionUnknown
@@ -443,7 +600,14 @@ func setConditionStatus(p *hlfv1alpha1.FabricPeer, conditionType hlfv1alpha1.Dep
 			return corev1.ConditionFalse
 		}
 	}
-	p.Status.Status = conditionType
+	if p.Status.Status != conditionType {
+		depCopy := client.MergeFrom(p.DeepCopy())
+		p.Status.Status = conditionType
+		err = r.Status().Patch(ctx, p, depCopy)
+		if err != nil {
+			log.Warnf("Failed to update status to %s: %v", conditionType, err)
+		}
+	}
 	if err != nil {
 		p.Status.Message = err.Error()
 	}
@@ -627,7 +791,14 @@ func CreateSignCryptoMaterial(conf *hlfv1alpha1.FabricPeer, caName string, caurl
 	return tlsCert, tlsKey, tlsRootCert, nil
 }
 
-func GetConfig(conf *hlfv1alpha1.FabricPeer, client *kubernetes.Clientset, chartName string, namespace string, svc *corev1.Service) (*FabricPeerChart, error) {
+func GetConfig(
+	conf *hlfv1alpha1.FabricPeer,
+	client *kubernetes.Clientset,
+	chartName string,
+	namespace string,
+	svc *corev1.Service,
+	refreshCerts bool,
+) (*FabricPeerChart, error) {
 	spec := conf.Spec
 	tlsParams := conf.Spec.Secret.Enrollment.TLS
 	tlsCAUrl := fmt.Sprintf("https://%s:%d", tlsParams.Cahost, tlsParams.Caport)
@@ -635,8 +806,10 @@ func GetConfig(conf *hlfv1alpha1.FabricPeer, client *kubernetes.Clientset, chart
 	var hosts []string
 	hosts = append(hosts, tlsParams.Csr.Hosts...)
 	hosts = append(hosts, ingressHosts...)
-	tlsCert, tlsKey, tlsRootCert, err := getExistingTLSCrypto(client, chartName, namespace)
-	if err != nil {
+	var tlsCert, tlsRootCert, tlsOpsCert, signCert, signRootCert *x509.Certificate
+	var tlsKey, tlsOpsKey, signKey *ecdsa.PrivateKey
+	var err error
+	if refreshCerts {
 		cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
 		if err != nil {
 			return nil, err
@@ -653,9 +826,28 @@ func GetConfig(conf *hlfv1alpha1.FabricPeer, client *kubernetes.Clientset, chart
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		tlsCert, tlsKey, tlsRootCert, err = getExistingTLSCrypto(client, chartName, namespace)
+		if err != nil {
+			cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
+			if err != nil {
+				return nil, err
+			}
+			tlsCert, tlsKey, tlsRootCert, err = CreateTLSCryptoMaterial(
+				conf,
+				tlsParams.Caname,
+				tlsCAUrl,
+				tlsParams.Enrollid,
+				tlsParams.Enrollsecret,
+				string(cacert),
+				hosts,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-	tlsOpsCert, tlsOpsKey, _, err := getExistingTLSOPSCrypto(client, chartName, namespace)
-	if err != nil {
+	if refreshCerts {
 		cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
 		if err != nil {
 			return nil, err
@@ -672,11 +864,30 @@ func GetConfig(conf *hlfv1alpha1.FabricPeer, client *kubernetes.Clientset, chart
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		tlsOpsCert, tlsOpsKey, _, err = getExistingTLSOPSCrypto(client, chartName, namespace)
+		if err != nil {
+			cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
+			if err != nil {
+				return nil, err
+			}
+			tlsOpsCert, tlsOpsKey, _, err = CreateTLSOPSCryptoMaterial(
+				conf,
+				tlsParams.Caname,
+				tlsCAUrl,
+				tlsParams.Enrollid,
+				tlsParams.Enrollsecret,
+				string(cacert),
+				hosts,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	signParams := conf.Spec.Secret.Enrollment.Component
 	caUrl := fmt.Sprintf("https://%s:%d", signParams.Cahost, signParams.Caport)
-	signCert, signKey, signRootCert, err := getExistingSignCrypto(client, chartName, namespace)
-	if err != nil {
+	if refreshCerts {
 		cacert, err := base64.StdEncoding.DecodeString(signParams.Catls.Cacert)
 		if err != nil {
 			return nil, err
@@ -691,6 +902,25 @@ func GetConfig(conf *hlfv1alpha1.FabricPeer, client *kubernetes.Clientset, chart
 		)
 		if err != nil {
 			return nil, err
+		}
+	} else {
+		signCert, signKey, signRootCert, err = getExistingSignCrypto(client, chartName, namespace)
+		if err != nil {
+			cacert, err := base64.StdEncoding.DecodeString(signParams.Catls.Cacert)
+			if err != nil {
+				return nil, err
+			}
+			signCert, signKey, signRootCert, err = CreateSignCryptoMaterial(
+				conf,
+				signParams.Caname,
+				caUrl,
+				signParams.Enrollid,
+				signParams.Enrollsecret,
+				string(cacert),
+			)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	tlsCRTEncoded := pem.EncodeToMemory(&pem.Block{

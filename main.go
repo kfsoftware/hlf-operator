@@ -18,6 +18,7 @@ package main
 
 import (
 	"flag"
+	"github.com/kfsoftware/hlf-operator/controllers/hlfmetrics"
 	"github.com/kfsoftware/hlf-operator/controllers/ordnode"
 	"github.com/kfsoftware/hlf-operator/controllers/utils"
 	log "github.com/sirupsen/logrus"
@@ -25,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/kfsoftware/hlf-operator/controllers/ca"
 	"github.com/kfsoftware/hlf-operator/controllers/ordservice"
@@ -74,6 +76,8 @@ func main() {
 	} else {
 		restConfig = ctrl.GetConfigOrDie()
 	}
+	// Register custom metrics with the global prometheus registry
+	metrics.Registry.MustRegister(hlfmetrics.CertificateExpiryTimeSeconds)
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:             scheme,
 		MetricsBindAddress: metricsAddr,

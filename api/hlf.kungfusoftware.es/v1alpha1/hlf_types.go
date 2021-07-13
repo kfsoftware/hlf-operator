@@ -79,6 +79,10 @@ type ServiceMonitor struct {
 type FabricPeerSpec struct {
 	// +optional
 	// +nullable
+	UpdateCertificateTime *metav1.Time `json:"updateCertificateTime"`
+
+	// +optional
+	// +nullable
 	ServiceMonitor *ServiceMonitor `json:"serviceMonitor"`
 	// +optional
 	// +nullable
@@ -254,6 +258,10 @@ type FabricPeerStatus struct {
 	Status     DeploymentStatus  `json:"status"`
 
 	// +optional
+	// +nullable
+	LastCertificateUpdate *metav1.Time `json:"lastCertificateUpdate"`
+
+	// +optional
 	SignCert string `json:"signCert"`
 	// +optional
 	TlsCert string `json:"tlsCert"`
@@ -297,8 +305,11 @@ const (
 	BootstrapMethodFile = "file"
 )
 
-// FabricOrderingServiceSpec defines the desired state of FabricOrderingService
+// FabricOrdererNodeSpec defines the desired state of FabricOrdererNode
 type FabricOrdererNodeSpec struct {
+	// +optional
+	// +nullable
+	UpdateCertificateTime *metav1.Time `json:"updateCertificateTime"`
 	// +optional
 	// +nullable
 	ServiceMonitor *ServiceMonitor `json:"serviceMonitor"`
@@ -377,6 +388,13 @@ type FabricOrderingServiceStatus struct {
 type FabricOrdererNodeStatus struct {
 	Conditions status.Conditions `json:"conditions"`
 	Status     DeploymentStatus  `json:"status"`
+
+	// +optional
+	// +nullable
+	LastCertificateUpdate *metav1.Time `json:"lastCertificateUpdate"`
+
+	// +optional
+	SignCert string `json:"signCert"`
 	// +optional
 	TlsCert string `json:"tlsCert"`
 	// +optional
@@ -624,10 +642,12 @@ type FabricCASpecService struct {
 type DeploymentStatus string
 
 const (
-	PendingStatus DeploymentStatus = "PENDING"
-	FailedStatus  DeploymentStatus = "FAILED"
-	RunningStatus DeploymentStatus = "RUNNING"
-	UnknownStatus DeploymentStatus = "UNKNOWN"
+	PendingStatus        DeploymentStatus = "PENDING"
+	FailedStatus         DeploymentStatus = "FAILED"
+	RunningStatus        DeploymentStatus = "RUNNING"
+	UnknownStatus        DeploymentStatus = "UNKNOWN"
+	UpdatingVersion      DeploymentStatus = "UPDATING_VERSION"
+	UpdatingCertificates DeploymentStatus = "UPDATING_CERTIFICATES"
 )
 
 // FabricCAStatus defines the observed state of FabricCA
@@ -636,6 +656,7 @@ type FabricCAStatus struct {
 	Message    string            `json:"message"`
 	// Status of the FabricCA
 	Status DeploymentStatus `json:"status"`
+
 	// +optional
 	NodePort int `json:"nodePort"`
 	// TLS Certificate to connect to the FabricCA

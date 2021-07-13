@@ -7,18 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
-	"errors"
 	"fmt"
-	"os"
-	"reflect"
-	"strings"
-	"time"
-
 	"github.com/go-logr/logr"
 	hlfv1alpha1 "github.com/kfsoftware/hlf-operator/api/hlf.kungfusoftware.es/v1alpha1"
 	"github.com/kfsoftware/hlf-operator/controllers/certs"
+	"github.com/kfsoftware/hlf-operator/controllers/hlfmetrics"
 	"github.com/kfsoftware/hlf-operator/controllers/utils"
 	"github.com/operator-framework/operator-lib/status"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart/loader"
@@ -29,14 +25,23 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/kubernetes/pkg/api/v1/pod"
+	"os"
+	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"strings"
+	"time"
 )
+
+
+
+
 
 // FabricOrdererNodeReconciler reconciles a FabricOrdererNode object
 type FabricOrdererNodeReconciler struct {
@@ -146,7 +151,48 @@ func (r *FabricOrdererNodeReconciler) Reconcile(req ctrl.Request) (ctrl.Result, 
 	}
 	if exists {
 		// update
-		s, err := GetOrdererState(cfg, r.Config, releaseName, ns)
+
+		log.Printf("Status hasn't changed, skipping update")
+		c, err := getConfig(fabricOrdererNode, clientSet, releaseName, req.Namespace, false)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		err = r.upgradeChart(cfg, err, ns, releaseName, c)
+		if err != nil {
+			r.setConditionStatus(ctx, fabricOrdererNode, hlfv1alpha1.FailedStatus, false, err, false)
+			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricOrdererNode)
+		}
+		lastTimeCertsRenewed := fabricOrdererNode.Status.LastCertificateUpdate
+		if fabricOrdererNode.Status.LastCertificateUpdate != nil {
+			if fabricOrdererNode.Status.LastCertificateUpdate != nil {
+				lastCertificateUpdate := fabricOrdererNode.Status.LastCertificateUpdate.Time
+				if fabricOrdererNode.Spec.UpdateCertificateTime.Time.After(lastCertificateUpdate) {
+					// must update the certificates and block until it's done
+					// scale down to zero replicas
+					// wait for the deployment to scale down
+					// update the certs
+					// scale up the peer
+					log.Infof("Trying to upgrade certs")
+					err := r.updateCerts(req, fabricOrdererNode, clientSet, releaseName, ctx, cfg, ns)
+					if err != nil {
+						log.Errorf("Error renewing certs: %v", err)
+						r.setConditionStatus(ctx, fabricOrdererNode, hlfv1alpha1.FailedStatus, false, err, false)
+						return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricOrdererNode)
+					}
+					lastTimeCertsRenewed = fabricOrdererNode.Spec.UpdateCertificateTime
+				}
+			}
+		} else if fabricOrdererNode.Status.LastCertificateUpdate == nil && fabricOrdererNode.Spec.UpdateCertificateTime != nil {
+			log.Infof("Trying to upgrade certs")
+			err := r.updateCerts(req, fabricOrdererNode, clientSet, releaseName, ctx, cfg, ns)
+			if err != nil {
+				log.Errorf("Error renewing certs: %v", err)
+				r.setConditionStatus(ctx, fabricOrdererNode, hlfv1alpha1.FailedStatus, false, err, false)
+				return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricOrdererNode)
+			}
+			lastTimeCertsRenewed = fabricOrdererNode.Spec.UpdateCertificateTime
+		}
+		s, err := GetOrdererState(cfg, r.Config, releaseName, ns, fabricOrdererNode)
 		if err != nil {
 			log.Printf("Failed to get orderer state=%v", err)
 			return ctrl.Result{}, err
@@ -155,49 +201,21 @@ func (r *FabricOrdererNodeReconciler) Reconcile(req ctrl.Request) (ctrl.Result, 
 		fOrderer.Status.Status = s.Status
 		fOrderer.Status.NodePort = s.NodePort
 		fOrderer.Status.TlsCert = s.TlsCert
+		fOrderer.Status.SignCert = s.SignCert
 		fOrderer.Status.TlsAdminCert = s.TlsAdminCert
 		fOrderer.Status.AdminPort = s.AdminPort
 		fOrderer.Status.OperationsPort = s.OperationsPort
+		fOrderer.Status.LastCertificateUpdate = lastTimeCertsRenewed
 		fOrderer.Status.Conditions.SetCondition(status.Condition{
 			Type:   status.ConditionType(s.Status),
 			Status: "True",
 		})
 
-		log.Printf("Status hasn't changed, skipping update")
-		c, err := getConfig(fabricOrdererNode, clientSet, releaseName, req.Namespace)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		inrec, err := json.Marshal(c)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		var inInterface map[string]interface{}
-		err = json.Unmarshal(inrec, &inInterface)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		cmd := action.NewUpgrade(cfg)
-		err = os.Setenv("HELM_NAMESPACE", ns)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		settings := cli.New()
-		chartPath, err := cmd.LocateChart(r.ChartPath, settings)
-		ch, err := loader.Load(chartPath)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		release, err := cmd.Run(releaseName, ch, inInterface)
-		if err != nil {
-			setConditionStatus(fabricOrdererNode, hlfv1alpha1.FailedStatus, false, err, false)
-			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricOrdererNode)
-		}
-		log.Infof("Chart upgraded %s", release.Name)
 		if !reflect.DeepEqual(fOrderer.Status, fabricOrdererNode.Status) {
 			if err := r.Status().Update(ctx, fOrderer); err != nil {
-				log.Printf("Error updating the status: %v", err)
-				return ctrl.Result{}, err
+				log.Errorf("Error updating the status: %v", err)
+				r.setConditionStatus(ctx, fabricOrdererNode, hlfv1alpha1.FailedStatus, false, err, false)
+				return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricOrdererNode)
 			}
 		}
 		switch s.Status {
@@ -230,7 +248,7 @@ func (r *FabricOrdererNodeReconciler) Reconcile(req ctrl.Request) (ctrl.Result, 
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		c, err := getConfig(fabricOrdererNode, clientSet, releaseName, req.Namespace)
+		c, err := getConfig(fabricOrdererNode, clientSet, releaseName, req.Namespace, false)
 		if err != nil {
 			reqLogger.Error(err, fmt.Sprintf("Failed to get config for orderer %s/%s", req.Namespace, req.Name))
 			return ctrl.Result{}, err
@@ -254,7 +272,7 @@ func (r *FabricOrdererNodeReconciler) Reconcile(req ctrl.Request) (ctrl.Result, 
 		}
 		release, err := cmd.Run(ch, inInterface)
 		if err != nil {
-			setConditionStatus(fabricOrdererNode, hlfv1alpha1.FailedStatus, false, err, false)
+			r.setConditionStatus(ctx, fabricOrdererNode, hlfv1alpha1.FailedStatus, false, err, false)
 			return r.updateCRStatusOrFailReconcile(ctx, r.Log, fabricOrdererNode)
 		}
 		log.Printf("Chart installed %s", release.Name)
@@ -287,7 +305,14 @@ func (r *FabricOrdererNodeReconciler) updateCRStatusOrFailReconcile(ctx context.
 	}
 	return ctrl.Result{}, nil
 }
-func setConditionStatus(p *hlfv1alpha1.FabricOrdererNode, conditionType hlfv1alpha1.DeploymentStatus, statusFlag bool, err error, statusUnknown bool) (update bool) {
+func (r *FabricOrdererNodeReconciler) setConditionStatus(
+	ctx context.Context,
+	p *hlfv1alpha1.FabricOrdererNode,
+	conditionType hlfv1alpha1.DeploymentStatus,
+	statusFlag bool,
+	err error,
+	statusUnknown bool,
+) (update bool) {
 	statusStr := func() corev1.ConditionStatus {
 		if statusUnknown {
 			return corev1.ConditionUnknown
@@ -298,7 +323,14 @@ func setConditionStatus(p *hlfv1alpha1.FabricOrdererNode, conditionType hlfv1alp
 			return corev1.ConditionFalse
 		}
 	}
-	p.Status.Status = conditionType
+	if p.Status.Status != conditionType {
+		depCopy := client.MergeFrom(p.DeepCopy())
+		p.Status.Status = conditionType
+		err = r.Status().Patch(ctx, p, depCopy)
+		if err != nil {
+			log.Warnf("Failed to update status to %s: %v", conditionType, err)
+		}
+	}
 	if err != nil {
 		p.Status.Message = err.Error()
 	}
@@ -326,6 +358,133 @@ func (r *FabricOrdererNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
+func (r *FabricOrdererNodeReconciler) updateCerts(req ctrl.Request, node *hlfv1alpha1.FabricOrdererNode, clientSet *kubernetes.Clientset, releaseName string, ctx context.Context, cfg *action.Configuration, ns string) error {
+	log.Infof("Trying to upgrade certs")
+	r.setConditionStatus(ctx, node, hlfv1alpha1.UpdatingCertificates, false, nil, false)
+	config, err := getConfig(node, clientSet, releaseName, req.Namespace, true)
+	if err != nil {
+		log.Errorf("Error getting the config: %v", err)
+		return err
+	}
+	//config.Replicas = 0
+	err = r.upgradeChart(cfg, err, ns, releaseName, config)
+	if err != nil {
+		return err
+	}
+	dep, err := GetOrdererDeployment(
+		cfg,
+		r.Config,
+		releaseName,
+		req.Namespace,
+	)
+	if err != nil {
+		return err
+	}
+	err = restartDeployment(
+		r.Config,
+		dep,
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+func (r *FabricOrdererNodeReconciler) upgradeChart(
+	cfg *action.Configuration,
+	err error,
+	ns string,
+	releaseName string,
+	c *fabricOrdChart,
+) error {
+	inrec, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	var inInterface map[string]interface{}
+	err = json.Unmarshal(inrec, &inInterface)
+	if err != nil {
+		return err
+	}
+	cmd := action.NewUpgrade(cfg)
+	cmd.MaxHistory = 5
+	err = os.Setenv("HELM_NAMESPACE", ns)
+	if err != nil {
+		return err
+	}
+	settings := cli.New()
+	chartPath, err := cmd.LocateChart(r.ChartPath, settings)
+	ch, err := loader.Load(chartPath)
+	if err != nil {
+		return err
+	}
+	cmd.Wait = true
+	release, err := cmd.Run(releaseName, ch, inInterface)
+	if err != nil {
+		return err
+	}
+	log.Infof("Chart upgraded %s", release.Name)
+	return nil
+}
+func GetOrdererDeployment(conf *action.Configuration, config *rest.Config, releaseName string, ns string, ) (*appsv1.Deployment, error, ) {
+	ctx := context.Background()
+	cmd := action.NewGet(conf)
+	rel, err := cmd.Run(releaseName)
+	if err != nil {
+		return nil, err
+	}
+	clientSet, err := utils.GetClientKubeWithConf(config)
+	if err != nil {
+		return nil, err
+	}
+	if ns == "" {
+		ns = "default"
+	}
+	objects := utils.ParseK8sYaml([]byte(rel.Manifest))
+	for _, object := range objects {
+		kind := object.GetObjectKind().GroupVersionKind().Kind
+		if kind == "Deployment" {
+			depSpec := object.(*appsv1.Deployment)
+			dep, err := clientSet.AppsV1().Deployments(ns).Get(ctx, depSpec.Name, v1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return dep, nil
+		}
+	}
+	return nil, errors.Errorf("Deployment not found")
+
+}
+
+const (
+	deploymentRestartTriggerAnnotation = "es.kungfusoftware.hlf.deployment-restart.timestamp"
+)
+
+func restartDeployment(config *rest.Config, deployment *appsv1.Deployment) error {
+	clientSet, err := utils.GetClientKubeWithConf(config)
+	if err != nil {
+		return err
+	}
+
+	patchData := map[string]interface{}{}
+	patchData["spec"] = map[string]interface{}{
+		"template": map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					deploymentRestartTriggerAnnotation: time.Now().Format(time.Stamp),
+				},
+			},
+		},
+	}
+	encodedData, err := json.Marshal(patchData)
+	if err != nil {
+		return err
+	}
+	_, err = clientSet.AppsV1().Deployments(deployment.Namespace).Patch(context.TODO(), deployment.Name, types.MergePatchType, encodedData, v1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+	return nil
+}
 func getExistingTLSAdminCrypto(client *kubernetes.Clientset, chartName string, namespace string) (*x509.Certificate, *ecdsa.PrivateKey, *x509.Certificate, *x509.Certificate, error) {
 	secretName := fmt.Sprintf("%s-admin", chartName)
 	secret, err := client.CoreV1().Secrets(namespace).Get(context.Background(), secretName, v1.GetOptions{})
@@ -476,15 +635,23 @@ func CreateSignCryptoMaterial(conf *hlfv1alpha1.FabricOrdererNode, caName string
 	return tlsCert, tlsKey, tlsRootCert, nil
 }
 
-func getConfig(conf *hlfv1alpha1.FabricOrdererNode, client *kubernetes.Clientset, chartName string, namespace string) (*fabricOrdChart, error) {
+func getConfig(
+	conf *hlfv1alpha1.FabricOrdererNode,
+	client *kubernetes.Clientset,
+	chartName string,
+	namespace string,
+	refreshCerts bool,
+) (*fabricOrdChart, error) {
 	spec := conf.Spec
 	tlsParams := conf.Spec.Secret.Enrollment.TLS
 	tlsCAUrl := fmt.Sprintf("https://%s:%d", tlsParams.Cahost, tlsParams.Caport)
 	tlsHosts := []string{}
 	ingressHosts := []string{}
 	tlsHosts = append(tlsHosts, tlsParams.Csr.Hosts...)
-	tlsCert, tlsKey, tlsRootCert, err := getExistingTLSCrypto(client, chartName, namespace)
-	if err != nil {
+	var tlsCert, tlsRootCert, adminCert, adminRootCert, adminClientRootCert, signCert, signRootCert *x509.Certificate
+	var tlsKey, adminKey, signKey *ecdsa.PrivateKey
+	var err error
+	if refreshCerts {
 		cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
 		if err != nil {
 			return nil, err
@@ -501,10 +668,28 @@ func getConfig(conf *hlfv1alpha1.FabricOrdererNode, client *kubernetes.Clientset
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		tlsCert, tlsKey, tlsRootCert, err = getExistingTLSCrypto(client, chartName, namespace)
+		if err != nil {
+			cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
+			if err != nil {
+				return nil, err
+			}
+			tlsCert, tlsKey, tlsRootCert, err = CreateTLSCryptoMaterial(
+				conf,
+				tlsParams.Caname,
+				tlsCAUrl,
+				tlsParams.Enrollid,
+				tlsParams.Enrollsecret,
+				string(cacert),
+				tlsHosts,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
-
-	adminCert, adminKey, adminRootCert, adminClientRootCert, err := getExistingTLSAdminCrypto(client, chartName, namespace)
-	if err != nil {
+	if refreshCerts {
 		cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
 		if err != nil {
 			return nil, err
@@ -521,11 +706,30 @@ func getConfig(conf *hlfv1alpha1.FabricOrdererNode, client *kubernetes.Clientset
 		if err != nil {
 			return nil, err
 		}
+	} else {
+		adminCert, adminKey, adminRootCert, adminClientRootCert, err = getExistingTLSAdminCrypto(client, chartName, namespace)
+		if err != nil {
+			cacert, err := base64.StdEncoding.DecodeString(tlsParams.Catls.Cacert)
+			if err != nil {
+				return nil, err
+			}
+			adminCert, adminKey, adminRootCert, adminClientRootCert, err = CreateTLSAdminCryptoMaterial(
+				conf,
+				tlsParams.Caname,
+				tlsCAUrl,
+				tlsParams.Enrollid,
+				tlsParams.Enrollsecret,
+				string(cacert),
+				tlsHosts,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	signParams := conf.Spec.Secret.Enrollment.Component
 	caUrl := fmt.Sprintf("https://%s:%d", signParams.Cahost, signParams.Caport)
-	signCert, signKey, signRootCert, err := getExistingSignCrypto(client, chartName, namespace)
-	if err != nil {
+	if refreshCerts {
 		cacert, err := base64.StdEncoding.DecodeString(signParams.Catls.Cacert)
 		if err != nil {
 			return nil, err
@@ -540,6 +744,25 @@ func getConfig(conf *hlfv1alpha1.FabricOrdererNode, client *kubernetes.Clientset
 		)
 		if err != nil {
 			return nil, err
+		}
+	} else {
+		signCert, signKey, signRootCert, err = getExistingSignCrypto(client, chartName, namespace)
+		if err != nil {
+			cacert, err := base64.StdEncoding.DecodeString(signParams.Catls.Cacert)
+			if err != nil {
+				return nil, err
+			}
+			signCert, signKey, signRootCert, err = CreateSignCryptoMaterial(
+				conf,
+				signParams.Caname,
+				caUrl,
+				signParams.Enrollid,
+				signParams.Enrollsecret,
+				string(cacert),
+			)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	tlsCRTEncoded := pem.EncodeToMemory(&pem.Block{
@@ -740,7 +963,7 @@ func actionLogger(logger logr.Logger) func(format string, v ...interface{}) {
 	}
 }
 
-func GetOrdererState(conf *action.Configuration, config *rest.Config, releaseName string, ns string) (*hlfv1alpha1.FabricOrdererNodeStatus, error) {
+func GetOrdererState(conf *action.Configuration, config *rest.Config, releaseName string, ns string, ordNode *hlfv1alpha1.FabricOrdererNode) (*hlfv1alpha1.FabricOrdererNodeStatus, error) {
 	ctx := context.Background()
 	cmd := action.NewGet(conf)
 	rel, err := cmd.Run(releaseName)
@@ -760,11 +983,37 @@ func GetOrdererState(conf *action.Configuration, config *rest.Config, releaseNam
 		return nil, err
 	}
 	r.TlsCert = string(utils.EncodeX509Certificate(tlsCrt))
+	hlfmetrics.UpdateCertificateExpiry(
+		"orderer",
+		"tls",
+		tlsCrt,
+		ordNode.Name,
+		ns,
+	)
 	tlsAdminCrt, _, _, _, err := getExistingTLSAdminCrypto(clientSet, releaseName, ns)
 	if err != nil {
 		return nil, err
 	}
 	r.TlsAdminCert = string(utils.EncodeX509Certificate(tlsAdminCrt))
+	hlfmetrics.UpdateCertificateExpiry(
+		"orderer",
+		"tls_admin",
+		tlsAdminCrt,
+		ordNode.Name,
+		ns,
+	)
+	signCrt, _, _, err := getExistingSignCrypto(clientSet, releaseName, ns)
+	if err != nil {
+		return nil, err
+	}
+	r.SignCert = string(utils.EncodeX509Certificate(signCrt))
+	hlfmetrics.UpdateCertificateExpiry(
+		"orderer",
+		"sign",
+		signCrt,
+		ordNode.Name,
+		ns,
+	)
 	objects := utils.ParseK8sYaml([]byte(rel.Manifest))
 	for _, object := range objects {
 		kind := object.GetObjectKind().GroupVersionKind().Kind

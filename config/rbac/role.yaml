@@ -89,6 +89,18 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - replicasets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - secrets
   verbs:
   - create
@@ -197,6 +209,18 @@ rules:
 - apiGroups:
   - apps
   resources:
+  - replicasets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
   - secrets
   verbs:
   - create
@@ -282,6 +306,18 @@ rules:
   - extensions
   resources:
   - pods/status
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - extensions
+  resources:
+  - replicasets
   verbs:
   - create
   - delete
@@ -426,6 +462,18 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - monitoring.coreos.com
+  resources:
+  - servicemonitors
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - networking.istio.io
   resources:

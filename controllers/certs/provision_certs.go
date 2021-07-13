@@ -226,6 +226,67 @@ func GetCAInfo(params GetCAInfoRequest) (*api.GetCAInfoResponse, error) {
 	return caInfo, nil
 }
 
+
+func ReEnrollUser(params EnrollUserRequest) (*x509.Certificate, *ecdsa.PrivateKey, *x509.Certificate, error) {
+	keystorePath, err := ioutil.TempDir("", "enroll")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caClient, _, mgr, _, err := GetClient(FabricCAParams{
+		TLSCert: params.TLSCert,
+		URL:     params.URL,
+		Name:    params.Name,
+		MSPID:   params.MSPID,
+	}, keystorePath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	err = caClient.Reenroll(&api.ReenrollmentRequest{
+		Name:     params.User,
+		//Secret:   params.Secret,
+		CAName:   params.Name,
+		AttrReqs: params.Attributes,
+		Profile:  params.Profile,
+		Label:    "",
+		CSR: &api.CSRInfo{
+			Hosts: params.Hosts,
+			CN:    params.CN,
+		},
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	mgrIdentity := mgr[strings.ToLower(params.MSPID)].(*msp.IdentityManager)
+	u, err := mgrIdentity.GetUser(params.User)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	hexSubjectID := hex.EncodeToString(u.PrivateKey().SKI())
+	keyPath := fmt.Sprintf("%s/%s_sk", keystorePath, hexSubjectID)
+	pkBytes, err := ioutil.ReadFile(keyPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	userKey, err := utils.ParseECDSAPrivateKey(pkBytes)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	userCrt, err := utils.ParseX509Certificate(u.EnrollmentCertificate())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	info, err := caClient.GetCAInfo()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	rootCrt, err := utils.ParseX509Certificate(info.CAChain)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return userCrt, userKey, rootCrt, nil
+}
+
+
 func EnrollUser(params EnrollUserRequest) (*x509.Certificate, *ecdsa.PrivateKey, *x509.Certificate, error) {
 	keystorePath, err := ioutil.TempDir("", "enroll")
 	if err != nil {

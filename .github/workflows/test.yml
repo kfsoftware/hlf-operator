@@ -23,3 +23,11 @@ jobs:
         run: make generate manifests install
       - name: Test
         run: make test
+      - name: Show information
+        if: ${{ failure() }}
+        run: |
+          kubectl get nodes -o=wide
+          kubectl get pods -o=wide -A
+          kubectl get fabricpeers.hlf.kungfusoftware.es  -A -o=custom-columns='NAME:metadata.name,NAMESPACE:metadata.namespace,STATE:status.status,MESSAGE:status.message'
+          kubectl get fabricorderernodes.hlf.kungfusoftware.es  -A -o=custom-columns='NAME:metadata.name,NAMESPACE:metadata.namespace,STATE:status.status,MESSAGE:status.message'
+          kubectl get fabriccas.hlf.kungfusoftware.es -A -o=custom-columns='NAME:metadata.name,NAMESPACE:metadata.namespace,STATE:status.status,MESSAGE:status.message'

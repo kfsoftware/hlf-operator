@@ -12,7 +12,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-
+	"github.com/kfsoftware/hlf-operator/controllers/hlfmetrics"
 	"github.com/operator-framework/operator-lib/status"
 	"helm.sh/helm/v3/pkg/cli"
 	"k8s.io/kubernetes/pkg/api/v1/pod"
@@ -603,16 +603,37 @@ func GetCAState(clientSet *kubernetes.Clientset, ca *hlfv1alpha1.FabricCA, relea
 		return nil, err
 	}
 	r.TlsCert = string(utils.EncodeX509Certificate(tlsCrt))
+	hlfmetrics.UpdateCertificateExpiry(
+		"ca",
+		"tls",
+		tlsCrt,
+		releaseName,
+		ns,
+	)
 	signCrt, _, err := getExistingSignCrypto(clientSet, releaseName, ns)
 	if err != nil {
 		return nil, err
 	}
 	r.CACert = string(utils.EncodeX509Certificate(signCrt))
+	hlfmetrics.UpdateCertificateExpiry(
+		"ca",
+		"signca",
+		signCrt,
+		releaseName,
+		ns,
+	)
 	tlsCACrt, _, err := getExistingSignTLSCrypto(clientSet, releaseName, ns)
 	if err != nil {
 		return nil, err
 	}
 	r.TLSCACert = string(utils.EncodeX509Certificate(tlsCACrt))
+	hlfmetrics.UpdateCertificateExpiry(
+		"ca",
+		"tlsca",
+		tlsCACrt,
+		releaseName,
+		ns,
+	)
 	return r, nil
 }
 
@@ -754,6 +775,7 @@ func Reconcile(
 			return ctrl.Result{}, err
 		}
 		cmd := action.NewUpgrade(cfg)
+		cmd.MaxHistory = 5
 		settings := cli.New()
 		chartPath, err := cmd.LocateChart(r.ChartPath, settings)
 		ch, err := loader.Load(chartPath)
